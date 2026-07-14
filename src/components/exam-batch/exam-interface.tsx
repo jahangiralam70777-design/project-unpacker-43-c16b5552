@@ -425,7 +425,7 @@ export function ExamInterface() {
   }
 
   return (
-    <div className="pb-28 lg:pb-6">
+    <div className="pb-40 lg:pb-6">
       <ExamHeader
         title={meta?.title ?? "Exam"}
         subtitle={meta?.subjectName ?? meta?.subtitle ?? null}
@@ -643,7 +643,7 @@ function ExamHeader({
               className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-input bg-background/60 text-foreground/80 transition-colors hover:bg-muted lg:hidden"
               aria-label="Open question palette"
             >
-              <Menu className="h-4 w-4" />
+              <LayoutGrid className="h-4 w-4" />
             </button>
           </div>
         </div>
