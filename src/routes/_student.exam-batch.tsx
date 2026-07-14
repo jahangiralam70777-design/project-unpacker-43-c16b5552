@@ -77,6 +77,17 @@ function StudentExamBatchLayout() {
   });
   const banDecision = banStateQuery.data;
 
+  if ((banStateQuery.isLoading && !banStateQuery.data) || banStateQuery.isError) {
+    return (
+      <ExamBatchLayout nav={[]}>
+        <div className="mx-auto flex min-h-[40vh] w-full max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
+          <div className="h-9 w-9 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+          <p className="text-sm text-muted-foreground">Checking your Exam Batch access…</p>
+        </div>
+      </ExamBatchLayout>
+    );
+  }
+
   // Banned students see ONLY the ban screen inside the Exam Batch module.
   // The rest of the website (Dashboard, Quiz, Mock, MCQ Practice, etc.)
   // remains fully accessible.

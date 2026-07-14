@@ -87,7 +87,7 @@ import {
 } from "@/components/ui/select";
 import { useExamBatchFlow } from "./flow-store";
 import { useHydrated } from "@/hooks/use-hydrated";
-import { useRequireExamBatchApproval, useExamBatchAccess } from "./access-gate";
+import { useExamBatchAccess } from "./access-gate";
 import {
   useQuery,
   useMutation,
@@ -159,6 +159,10 @@ function toSessionCardData(
     subjectsCount: s.subjects_count,
     isCurrent: opts?.current,
   };
+}
+
+function safeNavigate(result: void | Promise<unknown>) {
+  void Promise.resolve(result).catch(() => {});
 }
 
 
@@ -573,7 +577,6 @@ export function LeaderboardSkeleton() {
 
 export function StudentLeaderboard() {
   const navigate = useNavigate();
-  const gate = useRequireExamBatchApproval();
   // Cascading Session → Subject → Exam. No auto-selection — the student
   // must explicitly choose each level, matching the Admin Leaderboard
   // flow. Backend queries are gated on the parent selection so no exams
@@ -1117,7 +1120,6 @@ function ProgressRing({ value, label }: { value: number; label: string }) {
 }
 
 export function StudentProgress() {
-  const gate = useRequireExamBatchApproval();
   const [window, setWindow] = useState<"daily" | "weekly" | "30d">("30d");
   const query = useQuery({
     queryKey: ["exam-batch", "student", "progress", window],
@@ -1513,7 +1515,6 @@ export function HistorySkeleton() {
 }
 
 export function StudentHistory() {
-  const gate = useRequireExamBatchApproval();
   const navigate = useNavigate();
   const ctx = useExamBatchCurrentSessionId();
   const [subjectId, setSubjectId] = useState<string>("all");
@@ -2504,7 +2505,7 @@ export function StudentEnrollment() {
           canViewProgress: false,
         },
       );
-      navigate({ to: "/exam-batch/pending" as never, replace: true });
+      safeNavigate(navigate({ to: "/exam-batch/pending" as never, replace: true }));
       return { previousEnrollments, sessionId: state.sessionId };
     },
     onSuccess: (row) => {
@@ -2583,11 +2584,11 @@ export function StudentEnrollment() {
               })
             : Promise.resolve(),
         ]);
-        navigate({ to: "/exam-batch/pending" as never, replace: true });
+        safeNavigate(navigate({ to: "/exam-batch/pending" as never, replace: true }));
         return;
       }
       toast.error(e.message || "Enrollment failed");
-      navigate({ to: "/exam-batch/enrollment" as never, replace: true });
+      safeNavigate(navigate({ to: "/exam-batch/enrollment" as never, replace: true }));
     },
     onSettled: (_row, _error, _variables, context) => {
       if (!context?.sessionId) return;
@@ -2857,7 +2858,7 @@ export function StudentPending() {
             type="button"
             onClick={() => {
               reset();
-              navigate({ to: "/exam-batch" as never });
+              safeNavigate(navigate({ to: "/exam-batch" as never }));
             }}
           >
             Start over
@@ -3645,7 +3646,6 @@ function MetaCell({
 export function StudentAvailable() {
   const navigate = useNavigate();
   const router = useRouter();
-  const gate = useRequireExamBatchApproval();
   const ctx = useExamBatchCurrentSessionId();
   const [q, setQ] = useState("");
   const [subjectId, setSubjectId] = useState<string>("all");
@@ -3868,7 +3868,7 @@ export function StudentAvailable() {
                   onTouchStart={prewarmExamInterfaceChunk}
                   onClick={() => {
                     void prewarmExamInterfaceChunk();
-                    navigate({
+                    safeNavigate(navigate({
                       to: "/exam-batch-take" as never,
                       // If we already have an in-progress attempt for this
                       // exam, jump straight to it — this skips the client's
@@ -3877,7 +3877,7 @@ export function StudentAvailable() {
                       search: (e.attemptId
                         ? { attemptId: e.attemptId }
                         : { examId: e.id }) as never,
-                    });
+                    }));
                   }}
                 >
                   <PlayCircle className="h-4 w-4" />
@@ -3894,7 +3894,6 @@ export function StudentAvailable() {
 
 
 export function StudentUpcoming() {
-  const gate = useRequireExamBatchApproval();
   const ctx = useExamBatchCurrentSessionId();
   const [subjectId, setSubjectId] = useState<string>("all");
   const [examId, setExamId] = useState<string>("all");
