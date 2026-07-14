@@ -171,6 +171,14 @@ const ROUTER_INVALIDATING_TABLES = new Set<string>([
   "exam_batch_settings",
 ]);
 
+const ACCESS_RESYNC_KEYS: unknown[][] = [
+  ["exam-batch", "public-settings"],
+  ["exam-batch", "student", "sessions"],
+  ["exam-batch", "student", "my-enrollments"],
+  ["exam-batch", "student", "access"],
+  ["exam-batch", "student", "enrolled-subjects"],
+];
+
 let mountCount = 0;
 let sharedChannel: ReturnType<typeof supabase.channel> | null = null;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -179,6 +187,14 @@ let routerInvalidatePromise: Promise<unknown> | null = null;
 let routerInvalidateQueued = false;
 let accessResyncPromise: Promise<unknown> | null = null;
 let accessResyncQueued = false;
+
+function startsWithKey(key: readonly unknown[], prefix: readonly unknown[]) {
+  return prefix.every((part, index) => key[index] === part);
+}
+
+function isAccessResyncKey(key: readonly unknown[]) {
+  return ACCESS_RESYNC_KEYS.some((prefix) => startsWithKey(key, prefix));
+}
 
 // Tab-visibility bookkeeping: only trigger the expensive access re-sync
 // (which calls `router.invalidate()` and re-runs `beforeLoad`) when the
@@ -227,15 +243,8 @@ function queueAccessResync(qc: QueryClient, router: AnyRouter) {
   }
   const run = async (): Promise<void> => {
     try {
-      const keys: unknown[][] = [
-        ["exam-batch", "public-settings"],
-        ["exam-batch", "student", "sessions"],
-        ["exam-batch", "student", "my-enrollments"],
-        ["exam-batch", "student", "access"],
-        ["exam-batch", "student", "enrolled-subjects"],
-      ];
       await Promise.allSettled(
-        keys.map((queryKey) =>
+        ACCESS_RESYNC_KEYS.map((queryKey) =>
           qc.invalidateQueries({ queryKey, refetchType: "active" }),
         ),
       );
@@ -261,6 +270,7 @@ function flush(qc: QueryClient, router: AnyRouter) {
       const sig = key.join("|");
       if (seen.has(sig)) continue;
       seen.add(sig);
+      if (shouldInvalidateRouter && isAccessResyncKey(key)) continue;
       // Only refetch queries currently observed on-screen; cached-but-idle
       // pages stay warm and don't hit the network.
       void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
@@ -279,8 +289,21 @@ function flush(qc: QueryClient, router: AnyRouter) {
   }
 }
 
-function invalidateAll(qc: QueryClient) {
-  void qc.invalidateQueries({ queryKey: ["exam-batch"], refetchType: "active" });
+function invalidateAll(qc: QueryClient, opts?: { skipAccess?: boolean }) {
+  if (!opts?.skipAccess) {
+    void qc.invalidateQueries({ queryKey: ["exam-batch"], refetchType: "active" });
+    return;
+  }
+  const seen = new Set<string>();
+  for (const scopes of Object.values(TABLE_SCOPES)) {
+    for (const key of scopes) {
+      if (isAccessResyncKey(key)) continue;
+      const sig = key.join("|");
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
+    }
+  }
 }
 
 // Re-sync access-critical state after a period during which we may have
@@ -291,11 +314,6 @@ function invalidateAll(qc: QueryClient) {
 // analytics, downloads, etc.) are handled by the broader `invalidateAll`
 // path — this stays narrow to avoid unnecessary router work.
 function resyncAccess(qc: QueryClient, router: AnyRouter) {
-  for (const table of ROUTER_INVALIDATING_TABLES) {
-    for (const key of TABLE_SCOPES[table] ?? []) {
-      void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
-    }
-  }
   queueAccessResync(qc, router);
 }
 
@@ -378,7 +396,7 @@ export function useExamBatchRealtime() {
         // that happened while the socket was down are gone — we must
         // resync access state on every (re)subscribe, not just the first.
         if (status === "SUBSCRIBED") {
-          invalidateAll(qc);
+          invalidateAll(qc, { skipAccess: true });
           resyncAccess(qc, router);
         }
       });
@@ -409,7 +427,7 @@ export function useExamBatchRealtime() {
         // A brief tab-switch cannot have missed a Postgres change
         // relevant to access decisions; skip the re-sync entirely.
         if (hiddenFor < MIN_HIDDEN_MS_FOR_RESYNC) return;
-        invalidateAll(qc);
+        invalidateAll(qc, { skipAccess: true });
         resyncAccess(qc, router);
       }, VISIBILITY_DEBOUNCE_MS);
     };
@@ -419,13 +437,13 @@ export function useExamBatchRealtime() {
       // Reset the hidden-timer so the next visibilitychange also
       // triggers a resync even if the tab was foreground the whole time.
       hiddenSinceMs = Date.now() - MIN_HIDDEN_MS_FOR_RESYNC;
-      invalidateAll(qc);
+      invalidateAll(qc, { skipAccess: true });
       resyncAccess(qc, router);
     };
     const handlePageShow = (event: PageTransitionEvent) => {
       if (event.persisted || document.visibilityState === "visible") {
         hiddenSinceMs = Date.now() - MIN_HIDDEN_MS_FOR_RESYNC;
-        invalidateAll(qc);
+        invalidateAll(qc, { skipAccess: true });
         resyncAccess(qc, router);
       }
     };
@@ -463,7 +481,7 @@ export function useExamBatchRealtime() {
       }
       if (event === "SIGNED_IN" || event === "SIGNED_OUT" || event === "USER_UPDATED") {
         void applyAuth();
-        invalidateAll(qc);
+        invalidateAll(qc, { skipAccess: true });
         // Auth identity changes affect what the access RPC returns; re-run
         // the route guard so the student lands on the right page.
         resyncAccess(qc, router);
