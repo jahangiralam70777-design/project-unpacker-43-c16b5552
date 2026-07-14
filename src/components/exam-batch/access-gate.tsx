@@ -40,12 +40,18 @@ export function useExamBatchAccess() {
     queryFn: () => listAvailableExamBatchSessions({ data: {} }),
     staleTime: 30_000,
     placeholderData: keepPreviousData,
+    retry: 2,
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
   });
   const enrollmentsQuery = useQuery({
     queryKey: ["exam-batch", "student", "my-enrollments"],
     queryFn: () => listMyExamBatchEnrollments({ data: {} }),
     staleTime: 15_000,
     placeholderData: keepPreviousData,
+    retry: 2,
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
   });
 
   const sessions = sessionsQuery.data ?? [];
@@ -89,6 +95,9 @@ export function useExamBatchAccess() {
     enabled: !!sessionId,
     staleTime: 15_000,
     placeholderData: keepPreviousData,
+    retry: 2,
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
   });
 
   // Prefer the enrollment row's status (source of truth from the

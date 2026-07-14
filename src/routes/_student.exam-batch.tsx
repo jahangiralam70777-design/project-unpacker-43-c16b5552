@@ -1,5 +1,6 @@
 import { createFileRoute, Link, redirect, useRouter } from "@tanstack/react-router";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { ExamBatchLayout } from "@/components/exam-batch/layout";
 import { useExamBatchStudentNav } from "@/components/exam-batch/access-gate";
 import { StudentExamBatchBanPage } from "@/components/exam-batch/student-ban-page";
@@ -29,6 +30,23 @@ const POST_APPROVAL_PREFIXES = [
   "/exam-batch/progress",
   "/exam-batch/history",
 ];
+
+const EXAM_BATCH_GUARD_TIMEOUT_MS = 8_000;
+
+function withGuardTimeout<T>(promise: Promise<T>, ms = EXAM_BATCH_GUARD_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("Exam Batch access check timed out")),
+        ms,
+      );
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 function normalize(p: string) {
   const n = p.replace(/\/+$/, "");
@@ -74,10 +92,13 @@ function StudentExamBatchLayout() {
     queryFn: () => getExamBatchAccessState(),
     staleTime: 15_000,
     placeholderData: keepPreviousData,
+    retry: 2,
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
   });
   const banDecision = banStateQuery.data;
 
-  if ((banStateQuery.isLoading && !banStateQuery.data) || banStateQuery.isError) {
+  if (banStateQuery.isLoading && !banStateQuery.data) {
     return (
       <ExamBatchLayout nav={[]}>
         <div className="mx-auto flex min-h-[40vh] w-full max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
@@ -105,6 +126,14 @@ function StudentExamBatchLayout() {
   return <ExamBatchLayout nav={nav} />;
 }
 
+function ExamBatchStaticShell({ children }: { children: ReactNode }) {
+  return (
+    <div className="mx-auto w-full max-w-7xl space-y-6 px-3 pb-10 pt-3 sm:px-5 sm:pt-4 lg:px-6">
+      <div className="space-y-6">{children}</div>
+    </div>
+  );
+}
+
 // Never render nothing. Any time TanStack Router enters the pending state
 // for this route — first load, hard refresh, direct URL entry, or a
 // realtime `router.invalidate()` where no previous match is on screen —
@@ -115,12 +144,12 @@ function StudentExamBatchLayout() {
 // produce a white screen.
 function ExamBatchLayoutPending() {
   return (
-    <ExamBatchLayout nav={[]}>
+    <ExamBatchStaticShell>
       <div className="mx-auto flex min-h-[40vh] w-full max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
         <div className="h-9 w-9 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
         <p className="text-sm text-muted-foreground">Loading your Exam Batch workspace…</p>
       </div>
-    </ExamBatchLayout>
+    </ExamBatchStaticShell>
   );
 }
 
@@ -153,28 +182,35 @@ export const Route = createFileRoute("/_student/exam-batch")({
       queryKey: readonly unknown[],
       queryFn: () => Promise<T>,
       staleTime: number,
-    ): Promise<T | undefined> => {
+    ): Promise<{ ok: boolean; data: T | undefined }> => {
       try {
-        return await context.queryClient.fetchQuery({
-          queryKey: queryKey as unknown[],
-          queryFn,
-          staleTime,
-        });
+        const data = await withGuardTimeout(
+          context.queryClient.fetchQuery({
+            queryKey: queryKey as unknown[],
+            queryFn,
+            staleTime,
+          }),
+        );
+        return { ok: true, data };
       } catch {
         // Fall back to any cached value we have; undefined otherwise.
-        return context.queryClient.getQueryData<T>(queryKey as unknown[]);
+        return {
+          ok: false,
+          data: context.queryClient.getQueryData<T>(queryKey as unknown[]),
+        };
       }
     };
 
     // 1) Module visibility (admin can hide Exam Batch entirely). Uses the
     //    same queryKey as `useExamBatchVisibility` so there is no duplicate
     //    request — the cached value is reused everywhere.
-    const settings = await safeFetch(
+    const settingsResult = await safeFetch(
       ["exam-batch", "public-settings"],
       () => getExamBatchPublicSettings(),
       30_000,
     );
-    if (settings?.moduleVisible === false) {
+    const settings = settingsResult.data;
+    if (settingsResult.ok && settings?.moduleVisible === false) {
       if (here !== "/dashboard") throw redirect({ to: "/dashboard", replace: true });
       return;
     }
@@ -184,13 +220,20 @@ export const Route = createFileRoute("/_student/exam-batch")({
     // status + student_id live on the same database row, so deriving access
     // from it prevents a split-query race where fresh enrollments + stale
     // access cache disagree during admin-driven status changes.
-    const enrollments = await safeFetch(
+    const enrollmentsResult = await safeFetch(
       ["exam-batch", "student", "my-enrollments"],
       () => listMyExamBatchEnrollments({ data: {} }),
       0,
     );
 
-    const currentEnrollment = pickCurrentEnrollment(enrollments ?? []);
+    // Mobile browsers can restore a tab before auth/network state has fully
+    // resumed. If the authoritative enrollment read fails or times out, do
+    // not derive redirects from stale/missing data. Render the existing route
+    // shell instead; the realtime/resume bridge retries immediately after the
+    // browser is usable again.
+    if (!enrollmentsResult.ok) return;
+
+    const currentEnrollment = pickCurrentEnrollment(enrollmentsResult.data ?? []);
     const sessionId = currentEnrollment?.session_id ?? null;
 
     // 3) Keep the access cache in lock-step with the enrollment row before
@@ -256,29 +299,31 @@ function ExamBatchLayoutError({ error, reset }: { error: Error; reset: () => voi
   // student experience (dashboard, quizzes, mocks, etc.).
   const router = useRouter();
   return (
-    <div className="mx-auto flex min-h-[40vh] max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
-      <h2 className="text-lg font-semibold text-foreground">Exam Batch is momentarily unavailable</h2>
-      <p className="text-sm text-muted-foreground">
-        {error?.message?.slice(0, 200) || "We couldn't load your Exam Batch data. Please try again."}
-      </p>
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        <button
-          type="button"
-          onClick={() => {
-            reset();
-            void router.invalidate();
-          }}
-          className="inline-flex items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
-        >
-          Retry
-        </button>
-        <Link
-          to="/dashboard"
-          className="inline-flex items-center justify-center rounded-lg border border-border/60 bg-background/60 px-4 py-2 text-sm font-semibold text-foreground hover:bg-accent"
-        >
-          Back to dashboard
-        </Link>
+    <ExamBatchStaticShell>
+      <div className="mx-auto flex min-h-[40vh] max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
+        <h2 className="text-lg font-semibold text-foreground">Exam Batch is momentarily unavailable</h2>
+        <p className="text-sm text-muted-foreground">
+          {error?.message?.slice(0, 200) || "We couldn't load your Exam Batch data. Please try again."}
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              reset();
+              void router.invalidate();
+            }}
+            className="inline-flex items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
+          >
+            Retry
+          </button>
+          <Link
+            to="/dashboard"
+            className="inline-flex items-center justify-center rounded-lg border border-border/60 bg-background/60 px-4 py-2 text-sm font-semibold text-foreground hover:bg-accent"
+          >
+            Back to dashboard
+          </Link>
+        </div>
       </div>
-    </div>
+    </ExamBatchStaticShell>
   );
 }
