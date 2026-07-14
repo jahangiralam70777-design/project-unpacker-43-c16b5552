@@ -5,7 +5,6 @@ import { useExamBatchStudentNav } from "@/components/exam-batch/access-gate";
 import { StudentExamBatchBanPage } from "@/components/exam-batch/student-ban-page";
 import {
   listMyExamBatchEnrollments,
-  getExamBatchAccess,
 } from "@/lib/exam-batch/student-enrollment.functions";
 import { getExamBatchAccessState } from "@/lib/exam-batch/student-attendance.functions";
 import { getExamBatchPublicSettings } from "@/lib/exam-batch/public-settings.functions";
@@ -51,6 +50,19 @@ function pickCurrentEnrollment(
   );
 }
 
+function accessFromEnrollment(row: ExamBatchEnrollmentRow | null) {
+  const approved = row?.status === "approved" && typeof row.student_id === "number";
+  return {
+    enrolled: !!row,
+    status: row?.status ?? null,
+    studentId: row?.student_id ?? null,
+    canAccessDashboard: approved,
+    canTakeExams: approved,
+    canViewLeaderboard: approved,
+    canViewProgress: approved,
+  };
+}
+
 function StudentExamBatchLayout() {
   const nav = useExamBatchStudentNav();
 
@@ -64,6 +76,17 @@ function StudentExamBatchLayout() {
     placeholderData: keepPreviousData,
   });
   const banDecision = banStateQuery.data;
+
+  if ((banStateQuery.isLoading && !banStateQuery.data) || banStateQuery.isError) {
+    return (
+      <ExamBatchLayout nav={[]}>
+        <div className="mx-auto flex min-h-[40vh] w-full max-w-lg flex-col items-center justify-center gap-3 rounded-3xl border border-border/60 bg-background/60 p-6 text-center">
+          <div className="h-9 w-9 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+          <p className="text-sm text-muted-foreground">Checking your Exam Batch access…</p>
+        </div>
+      </ExamBatchLayout>
+    );
+  }
 
   // Banned students see ONLY the ban screen inside the Exam Batch module.
   // The rest of the website (Dashboard, Quiz, Mock, MCQ Practice, etc.)
@@ -161,39 +184,35 @@ export const Route = createFileRoute("/_student/exam-batch")({
       return;
     }
 
-    // 2) Load the student's enrollments (cached; shared with
-    //    `useExamBatchAccess` via the same queryKey so no duplicate fetch).
-    // NOTE: we use `fetchQuery` (not `ensureQueryData`) for the
-    // enrollment + access queries because these drive the authoritative
-    // pending ↔ approved ↔ rejected redirect. `ensureQueryData` returns
-    // stale-but-cached data immediately; when Supabase Realtime marks
-    // these keys stale after an admin status change and the exam-batch
-    // realtime hook calls `router.invalidate()`, we MUST see fresh data
-    // this run so `beforeLoad` can redirect on the same tick. `fetchQuery`
-    // refetches when stale, still returns cache when fresh — no extra
-    // network cost during normal navigation.
+    // 2) Load the student's enrollments (shared with `useExamBatchAccess`).
+    // This row is the single authoritative state for route decisions:
+    // status + student_id live on the same database row, so deriving access
+    // from it prevents a split-query race where fresh enrollments + stale
+    // access cache disagree during admin-driven status changes.
     const enrollments = await safeFetch(
       ["exam-batch", "student", "my-enrollments"],
       () => listMyExamBatchEnrollments({ data: {} }),
-      15_000,
+      0,
     );
 
     const currentEnrollment = pickCurrentEnrollment(enrollments ?? []);
     const sessionId = currentEnrollment?.session_id ?? null;
 
-    // 3) Authoritative approval decision (status=approved + student_id set).
-    //    Only queried when we have a candidate session — otherwise the user
-    //    has no enrollment at all and must see the Session picker.
-    let canAccessDashboard = false;
-    let enrollmentStatus: string | null = currentEnrollment?.status ?? null;
+    // 3) Keep the access cache in lock-step with the enrollment row before
+    //    child components render. This removes invalid intermediate states
+    //    during simultaneous query invalidations on mobile resume/realtime.
+    const derivedAccess = accessFromEnrollment(currentEnrollment);
+    const canAccessDashboard = derivedAccess.canAccessDashboard;
+    const enrollmentStatus = derivedAccess.status;
     if (sessionId) {
-      const access = await safeFetch(
+      context.queryClient.setQueryData(
         ["exam-batch", "student", "access", sessionId],
-        () => getExamBatchAccess({ data: { sessionId } }),
-        15_000,
+        derivedAccess,
       );
-      canAccessDashboard = access?.canAccessDashboard ?? false;
-      enrollmentStatus = access?.status ?? enrollmentStatus;
+      void context.queryClient.invalidateQueries({
+        queryKey: ["exam-batch", "student", "access", sessionId],
+        refetchType: "active",
+      });
     }
 
     const inPostArea = POST_APPROVAL_PREFIXES.some((p) => here.startsWith(p));
@@ -210,11 +229,7 @@ export const Route = createFileRoute("/_student/exam-batch")({
 
     if (currentEnrollment && enrollmentStatus === "pending") {
       // Enrolled but awaiting admin approval.
-      if (
-        inPostArea ||
-        here === "/exam-batch/subjects" ||
-        here === "/exam-batch/enrollment"
-      ) {
+      if (here !== "/exam-batch/pending") {
         throw redirect({ to: "/exam-batch/pending", replace: true });
       }
       return;

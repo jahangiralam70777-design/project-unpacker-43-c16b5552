@@ -171,20 +171,37 @@ const ROUTER_INVALIDATING_TABLES = new Set<string>([
   "exam_batch_settings",
 ]);
 
+const ACCESS_RESYNC_KEYS: unknown[][] = [
+  ["exam-batch", "public-settings"],
+  ["exam-batch", "student", "sessions"],
+  ["exam-batch", "student", "my-enrollments"],
+  ["exam-batch", "student", "access"],
+  ["exam-batch", "student", "enrolled-subjects"],
+];
+
 let mountCount = 0;
 let sharedChannel: ReturnType<typeof supabase.channel> | null = null;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 const pending = new Set<string>();
+let routerInvalidatePromise: Promise<unknown> | null = null;
+let routerInvalidateQueued = false;
+let accessResyncPromise: Promise<unknown> | null = null;
+let accessResyncQueued = false;
 
-// Tab-visibility bookkeeping: only trigger the expensive access re-sync
-// (which calls `router.invalidate()` and re-runs `beforeLoad`) when the
-// tab was actually hidden long enough that we could have realistically
-// missed a realtime event. Quick alt-tabs or focus/blur cycles must NOT
-// re-run the route guard — that was the root cause of "errors appear
-// and the page refreshes unexpectedly after returning to the tab".
+function startsWithKey(key: readonly unknown[], prefix: readonly unknown[]) {
+  return prefix.every((part, index) => key[index] === part);
+}
+
+function isAccessResyncKey(key: readonly unknown[]) {
+  return ACCESS_RESYNC_KEYS.some((prefix) => startsWithKey(key, prefix));
+}
+
+// Tab-visibility bookkeeping: mobile browsers routinely freeze sockets even
+// during short app switches. Re-sync access on every visible resume/focus,
+// but serialize the work below so route guards never overlap or blank.
 let hiddenSinceMs: number | null = null;
 let visibilityResyncTimer: ReturnType<typeof setTimeout> | null = null;
-const MIN_HIDDEN_MS_FOR_RESYNC = 15_000;
+const MIN_HIDDEN_MS_FOR_RESYNC = 0;
 const VISIBILITY_DEBOUNCE_MS = 250;
 
 function safeInvalidateRouter(router: AnyRouter) {
@@ -193,25 +210,65 @@ function safeInvalidateRouter(router: AnyRouter) {
   // its error boundary. Swallow the failure — the next realtime event,
   // online event, or user navigation will retry.
   try {
-    const p = router.invalidate();
-    if (p && typeof (p as { catch?: unknown }).catch === "function") {
-      (p as Promise<unknown>).catch(() => {});
+    if (routerInvalidatePromise) {
+      routerInvalidateQueued = true;
+      return;
     }
+    const run = async (): Promise<void> => {
+      try {
+        await router.invalidate();
+      } catch {
+        /* noop */
+      } finally {
+        routerInvalidatePromise = null;
+        if (routerInvalidateQueued) {
+          routerInvalidateQueued = false;
+          safeInvalidateRouter(router);
+        }
+      }
+    };
+    routerInvalidatePromise = run();
   } catch {
     /* noop */
   }
 }
 
+function queueAccessResync(qc: QueryClient, router: AnyRouter) {
+  if (accessResyncPromise) {
+    accessResyncQueued = true;
+    return;
+  }
+  const run = async (): Promise<void> => {
+    try {
+      await Promise.allSettled(
+        ACCESS_RESYNC_KEYS.map((queryKey) =>
+          qc.invalidateQueries({ queryKey, refetchType: "active" }),
+        ),
+      );
+    } finally {
+      safeInvalidateRouter(router);
+      accessResyncPromise = null;
+      if (accessResyncQueued) {
+        accessResyncQueued = false;
+        queueAccessResync(qc, router);
+      }
+    }
+  };
+  accessResyncPromise = run();
+}
+
 function flush(qc: QueryClient, router: AnyRouter) {
   flushTimer = null;
   const seen = new Set<string>();
-  let shouldInvalidateRouter = false;
+  const shouldInvalidateRouter = Array.from(pending).some((table) =>
+    ROUTER_INVALIDATING_TABLES.has(table),
+  );
   for (const table of pending) {
-    if (ROUTER_INVALIDATING_TABLES.has(table)) shouldInvalidateRouter = true;
     for (const key of TABLE_SCOPES[table] ?? []) {
       const sig = key.join("|");
       if (seen.has(sig)) continue;
       seen.add(sig);
+      if (shouldInvalidateRouter && isAccessResyncKey(key)) continue;
       // Only refetch queries currently observed on-screen; cached-but-idle
       // pages stay warm and don't hit the network.
       void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
@@ -226,12 +283,25 @@ function flush(qc: QueryClient, router: AnyRouter) {
   // Router keeps the previous route mounted during this transition, so
   // there is no unmount and no blank screen.
   if (shouldInvalidateRouter) {
-    safeInvalidateRouter(router);
+    queueAccessResync(qc, router);
   }
 }
 
-function invalidateAll(qc: QueryClient) {
-  void qc.invalidateQueries({ queryKey: ["exam-batch"], refetchType: "active" });
+function invalidateAll(qc: QueryClient, opts?: { skipAccess?: boolean }) {
+  if (!opts?.skipAccess) {
+    void qc.invalidateQueries({ queryKey: ["exam-batch"], refetchType: "active" });
+    return;
+  }
+  const seen = new Set<string>();
+  for (const scopes of Object.values(TABLE_SCOPES)) {
+    for (const key of scopes) {
+      if (isAccessResyncKey(key)) continue;
+      const sig = key.join("|");
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
+    }
+  }
 }
 
 // Re-sync access-critical state after a period during which we may have
@@ -242,12 +312,7 @@ function invalidateAll(qc: QueryClient) {
 // analytics, downloads, etc.) are handled by the broader `invalidateAll`
 // path — this stays narrow to avoid unnecessary router work.
 function resyncAccess(qc: QueryClient, router: AnyRouter) {
-  for (const table of ROUTER_INVALIDATING_TABLES) {
-    for (const key of TABLE_SCOPES[table] ?? []) {
-      void qc.invalidateQueries({ queryKey: key, refetchType: "active" });
-    }
-  }
-  safeInvalidateRouter(router);
+  queueAccessResync(qc, router);
 }
 
 /**
@@ -329,7 +394,7 @@ export function useExamBatchRealtime() {
         // that happened while the socket was down are gone — we must
         // resync access state on every (re)subscribe, not just the first.
         if (status === "SUBSCRIBED") {
-          invalidateAll(qc);
+          invalidateAll(qc, { skipAccess: true });
           resyncAccess(qc, router);
         }
       });
@@ -337,18 +402,10 @@ export function useExamBatchRealtime() {
 
     void ensureChannel();
 
-    // A hidden tab, an offline stretch, or a dropped socket can all cause
-    // the client to miss postgres_changes events. When we resume, we
-    // refresh cache and re-run route guards — but ONLY if the tab was
-    // actually hidden long enough to have plausibly missed something.
-    //
-    // Old behavior: every visibilitychange (including a 200ms alt-tab
-    // and Chrome's own throttled pings) called BOTH `invalidateAll` AND
-    // `resyncAccess`, which double-triggers `router.invalidate()`, re-runs
-    // the `_student/exam-batch` `beforeLoad`, and — if a fetchQuery inside
-    // it hits a transient error on wake — sends the whole layout to its
-    // error boundary. That is the exact "errors appear and the page
-    // refreshes" symptom described in Issue 2.
+    // A hidden tab, an offline stretch, BFCache restore, focus event, or a
+    // dropped socket can all cause the client to miss postgres_changes
+    // events. Mobile browsers can freeze a page almost immediately after
+    // switching apps, so every visible resume coordinates one access resync.
     const scheduleVisibilityResync = () => {
       if (visibilityResyncTimer) clearTimeout(visibilityResyncTimer);
       visibilityResyncTimer = setTimeout(() => {
@@ -357,10 +414,9 @@ export function useExamBatchRealtime() {
         hiddenSinceMs = null;
         if (document.visibilityState !== "visible") return;
         const hiddenFor = hiddenAt == null ? 0 : Date.now() - hiddenAt;
-        // A brief tab-switch cannot have missed a Postgres change
-        // relevant to access decisions; skip the re-sync entirely.
+        // Keep this guard configurable, but default to 0 for mobile safety.
         if (hiddenFor < MIN_HIDDEN_MS_FOR_RESYNC) return;
-        invalidateAll(qc);
+        invalidateAll(qc, { skipAccess: true });
         resyncAccess(qc, router);
       }, VISIBILITY_DEBOUNCE_MS);
     };
@@ -370,8 +426,19 @@ export function useExamBatchRealtime() {
       // Reset the hidden-timer so the next visibilitychange also
       // triggers a resync even if the tab was foreground the whole time.
       hiddenSinceMs = Date.now() - MIN_HIDDEN_MS_FOR_RESYNC;
-      invalidateAll(qc);
+      invalidateAll(qc, { skipAccess: true });
       resyncAccess(qc, router);
+    };
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted || document.visibilityState === "visible") {
+        hiddenSinceMs = Date.now() - MIN_HIDDEN_MS_FOR_RESYNC;
+        invalidateAll(qc, { skipAccess: true });
+        resyncAccess(qc, router);
+      }
+    };
+    const handleFocus = () => {
+      if (document.visibilityState !== "visible") return;
+      scheduleVisibilityResync();
     };
     const handleVisibility = () => {
       if (document.visibilityState === "hidden") {
@@ -387,6 +454,8 @@ export function useExamBatchRealtime() {
       hiddenSinceMs = Date.now();
     }
     window.addEventListener("online", handleOnline);
+    window.addEventListener("pageshow", handlePageShow);
+    window.addEventListener("focus", handleFocus);
     document.addEventListener("visibilitychange", handleVisibility);
 
     const { data: sub } = supabase.auth.onAuthStateChange((event) => {
@@ -401,7 +470,7 @@ export function useExamBatchRealtime() {
       }
       if (event === "SIGNED_IN" || event === "SIGNED_OUT" || event === "USER_UPDATED") {
         void applyAuth();
-        invalidateAll(qc);
+        invalidateAll(qc, { skipAccess: true });
         // Auth identity changes affect what the access RPC returns; re-run
         // the route guard so the student lands on the right page.
         resyncAccess(qc, router);
@@ -413,6 +482,8 @@ export function useExamBatchRealtime() {
     return () => {
       cancelled = true;
       window.removeEventListener("online", handleOnline);
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("focus", handleFocus);
       document.removeEventListener("visibilitychange", handleVisibility);
       if (visibilityResyncTimer) {
         clearTimeout(visibilityResyncTimer);

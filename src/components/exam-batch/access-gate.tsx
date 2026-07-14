@@ -50,6 +50,7 @@ export function useExamBatchAccess() {
 
   const sessions = sessionsQuery.data ?? [];
   const enrollments: ExamBatchEnrollmentRow[] = enrollmentsQuery.data ?? [];
+  const hasEnrollmentSnapshot = Array.isArray(enrollmentsQuery.data);
 
   const currentEnrollment = useMemo(() => {
     if (!enrollments.length) return null;
@@ -90,15 +91,20 @@ export function useExamBatchAccess() {
     placeholderData: keepPreviousData,
   });
 
-  const canAccessDashboard = accessQuery.data?.canAccessDashboard ?? false;
-  const studentId = accessQuery.data?.studentId ?? null;
   // Prefer the enrollment row's status (source of truth from the
   // enrollments table) so admin-driven transitions
   // (approved → pending / rejected / banned) reflect immediately, even
   // when the `access` RPC refetch is still in flight. The RPC result
   // remains a fallback for the initial load before enrollments arrive.
   const enrollmentStatus =
-    currentEnrollment?.status ?? accessQuery.data?.status ?? null;
+    hasEnrollmentSnapshot
+      ? (currentEnrollment?.status ?? null)
+      : (accessQuery.data?.status ?? null);
+  const studentId = hasEnrollmentSnapshot
+    ? (currentEnrollment?.student_id ?? null)
+    : (accessQuery.data?.studentId ?? null);
+  const canAccessDashboard =
+    enrollmentStatus === "approved" && typeof studentId === "number";
 
 
   // Only report `isLoading` on the very first fetch. Background refetches
