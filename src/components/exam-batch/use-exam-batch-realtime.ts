@@ -260,9 +260,10 @@ function queueAccessResync(qc: QueryClient, router: AnyRouter) {
 function flush(qc: QueryClient, router: AnyRouter) {
   flushTimer = null;
   const seen = new Set<string>();
-  let shouldInvalidateRouter = false;
+  const shouldInvalidateRouter = Array.from(pending).some((table) =>
+    ROUTER_INVALIDATING_TABLES.has(table),
+  );
   for (const table of pending) {
-    if (ROUTER_INVALIDATING_TABLES.has(table)) shouldInvalidateRouter = true;
     for (const key of TABLE_SCOPES[table] ?? []) {
       const sig = key.join("|");
       if (seen.has(sig)) continue;
