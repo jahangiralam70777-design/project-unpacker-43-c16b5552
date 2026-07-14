@@ -196,15 +196,12 @@ function isAccessResyncKey(key: readonly unknown[]) {
   return ACCESS_RESYNC_KEYS.some((prefix) => startsWithKey(key, prefix));
 }
 
-// Tab-visibility bookkeeping: only trigger the expensive access re-sync
-// (which calls `router.invalidate()` and re-runs `beforeLoad`) when the
-// tab was actually hidden long enough that we could have realistically
-// missed a realtime event. Quick alt-tabs or focus/blur cycles must NOT
-// re-run the route guard — that was the root cause of "errors appear
-// and the page refreshes unexpectedly after returning to the tab".
+// Tab-visibility bookkeeping: mobile browsers routinely freeze sockets even
+// during short app switches. Re-sync access on every visible resume/focus,
+// but serialize the work below so route guards never overlap or blank.
 let hiddenSinceMs: number | null = null;
 let visibilityResyncTimer: ReturnType<typeof setTimeout> | null = null;
-const MIN_HIDDEN_MS_FOR_RESYNC = 15_000;
+const MIN_HIDDEN_MS_FOR_RESYNC = 0;
 const VISIBILITY_DEBOUNCE_MS = 250;
 
 function safeInvalidateRouter(router: AnyRouter) {
@@ -404,18 +401,10 @@ export function useExamBatchRealtime() {
 
     void ensureChannel();
 
-    // A hidden tab, an offline stretch, or a dropped socket can all cause
-    // the client to miss postgres_changes events. When we resume, we
-    // refresh cache and re-run route guards — but ONLY if the tab was
-    // actually hidden long enough to have plausibly missed something.
-    //
-    // Old behavior: every visibilitychange (including a 200ms alt-tab
-    // and Chrome's own throttled pings) called BOTH `invalidateAll` AND
-    // `resyncAccess`, which double-triggers `router.invalidate()`, re-runs
-    // the `_student/exam-batch` `beforeLoad`, and — if a fetchQuery inside
-    // it hits a transient error on wake — sends the whole layout to its
-    // error boundary. That is the exact "errors appear and the page
-    // refreshes" symptom described in Issue 2.
+    // A hidden tab, an offline stretch, BFCache restore, focus event, or a
+    // dropped socket can all cause the client to miss postgres_changes
+    // events. Mobile browsers can freeze a page almost immediately after
+    // switching apps, so every visible resume coordinates one access resync.
     const scheduleVisibilityResync = () => {
       if (visibilityResyncTimer) clearTimeout(visibilityResyncTimer);
       visibilityResyncTimer = setTimeout(() => {
@@ -424,8 +413,7 @@ export function useExamBatchRealtime() {
         hiddenSinceMs = null;
         if (document.visibilityState !== "visible") return;
         const hiddenFor = hiddenAt == null ? 0 : Date.now() - hiddenAt;
-        // A brief tab-switch cannot have missed a Postgres change
-        // relevant to access decisions; skip the re-sync entirely.
+        // Keep this guard configurable, but default to 0 for mobile safety.
         if (hiddenFor < MIN_HIDDEN_MS_FOR_RESYNC) return;
         invalidateAll(qc, { skipAccess: true });
         resyncAccess(qc, router);
