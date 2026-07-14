@@ -233,6 +233,10 @@ function safeInvalidateRouter(router: AnyRouter) {
   }
 }
 
+function isTakingExam() {
+  return typeof window !== "undefined" && window.location.pathname.startsWith("/exam-batch-take");
+}
+
 function queueAccessResync(qc: QueryClient, router: AnyRouter) {
   if (accessResyncPromise) {
     accessResyncQueued = true;
@@ -246,7 +250,7 @@ function queueAccessResync(qc: QueryClient, router: AnyRouter) {
         ),
       );
     } finally {
-      safeInvalidateRouter(router);
+      if (!isTakingExam()) safeInvalidateRouter(router);
       accessResyncPromise = null;
       if (accessResyncQueued) {
         accessResyncQueued = false;

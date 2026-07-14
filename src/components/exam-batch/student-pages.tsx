@@ -593,11 +593,13 @@ export function StudentLeaderboard() {
     queryKey: ["exam-batch", "student", "sessions"],
     queryFn: () => listAvailableExamBatchSessions({ data: {} }),
     staleTime: 30_000,
+    placeholderData: keepPreviousData,
   });
   const enrollmentsQuery = useQuery({
     queryKey: ["exam-batch", "student", "my-enrollments"],
     queryFn: () => listMyExamBatchEnrollments({ data: {} }),
     staleTime: 15_000,
+    placeholderData: keepPreviousData,
   });
 
   const approvedSessionOptions = useMemo(() => {
